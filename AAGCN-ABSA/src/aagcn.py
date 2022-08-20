@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 import numpy
+import math
 import mindspore
 import mindspore.nn as nn
 from mindspore import Tensor, ops
-from mindspore.common.initializer import Normal
+from mindspore.common.initializer import initializer, HeUniform, Uniform, Normal, _calculate_fan_in_and_fan_out
 
 
 class Embedding(nn.Embedding):
@@ -23,6 +24,17 @@ class Embedding(nn.Embedding):
 
         return embedding
 
+class Dense(nn.Dense):
+    def __init__(self, in_channels, out_channels, has_bias=True, activation=None):
+        super().__init__(in_channels, out_channels, weight_init='normal', bias_init='zeros', has_bias=has_bias, activation=activation)
+        self.reset_parameters()
+        
+    def reset_parameters(self):
+        self.weight.set_data(initializer(HeUniform(math.sqrt(5)), self.weight.shape))
+        if self.has_bias:
+            fan_in, _ = _calculate_fan_in_and_fan_out(self.weight.shape)
+            bound = 1 / math.sqrt(fan_in)
+            self.bias.set_data(initializer(Uniform(bound), [self.out_channels]))
 
 class GraphConvolution(nn.Cell):
     def __init__(self, in_features, out_features, bias=True):
@@ -38,11 +50,10 @@ class GraphConvolution(nn.Cell):
             self.bias = None
 
     def construct(self, text, adj):
-        # torch.matmul对应ops.matmul
-        output = ops.matmul(text, self.weight)
+        output = ops.matmul(text.astype(mindspore.float16), self.weight.astype(mindspore.float16)).astype(mindspore.float32)
         denom = adj.sum(axis=2, keepdims=True) + 1
-        output = ops.matmul(adj, output)
-        # 使用ms的Tensor.sum() 传参为axis和keepdims 和torch不用
+        output = ops.matmul(adj.astype(mindspore.float16), output.astype(mindspore.float16)).astype(mindspore.float32)
+
         output = output / denom
         if self.bias is not None:
             return output + self.bias
@@ -62,9 +73,9 @@ class AAGCN(nn.Cell):
         self.gc2 = GraphConvolution(2*opt.hidden_dim, 2*opt.hidden_dim)
         self.gc3 = GraphConvolution(2*opt.hidden_dim, 2*opt.hidden_dim)
         self.gc4 = GraphConvolution(2*opt.hidden_dim, 2*opt.hidden_dim)
-        # mindspore.nn.Dense等价torch.nn.Linear
-        self.fc = nn.Dense(2*opt.hidden_dim, opt.polarities_dim)
-        # Dropout也可以等价替换
+
+        self.fc = Dense(2*opt.hidden_dim, opt.polarities_dim).to_float(mindspore.float16)
+        
         self.text_embed_dropout = nn.Dropout(1 - 0.3)
         self.relu = nn.ReLU()
         self.softmax = nn.Softmax(2)
@@ -80,9 +91,9 @@ class AAGCN(nn.Cell):
         x = self.relu(self.gc3(x, adj))
         x = self.relu(self.gc4(x, d_adj))
 
-        alpha_mat = ops.matmul(x, text_out.transpose(0, 2, 1))
+        alpha_mat = ops.matmul(x.astype(mindspore.float16), text_out.swapaxes(1, 2).astype(mindspore.float16)).astype(mindspore.float32)
         alpha = self.softmax(alpha_mat.sum(axis=1, keepdims=True))
-        x = ops.matmul(alpha, text_out).squeeze(1)
+        x = ops.matmul(alpha.astype(mindspore.float16), text_out.astype(mindspore.float16)).astype(mindspore.float32).squeeze(1)
 
         output = self.fc(x)
-        return output
+        return output.astype(mindspore.float32)

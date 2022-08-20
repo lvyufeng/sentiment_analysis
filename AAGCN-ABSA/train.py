@@ -182,7 +182,7 @@ if __name__ == '__main__':
     opt_adm = nn.Adam(net.trainable_params(),
                       opt.learning_rate, weight_decay=opt.l2reg)
     train_net = NetWithLoss(net, loss)
-    # scale_manager = mindspore.FixedLossScaleManager()
+    scale_manager = mindspore.DynamicLossScaleManager(2 ** 24, 2, 100)
     init_parameters(net)
     print_args(net, opt)
     train_net.set_train(True)
@@ -190,7 +190,7 @@ if __name__ == '__main__':
     print('[MODE] {}, train begin: {} epoch, {} step per epoch, {} eval'.format(
         opt.mode, opt.num_epoch, step_size, test_epoch), flush=True)
     # 创建 Model 对象
-    model = Model(train_net, optimizer=opt_adm)
+    model = Model(train_net, optimizer=opt_adm, loss_scale_manager=scale_manager)
     callback = EvalCallBack(net, train_net, opt, val_dataset, test_dataset)
     # 训练
     model.train(opt.num_epoch, train_dataset,

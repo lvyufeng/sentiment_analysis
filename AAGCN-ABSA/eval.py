@@ -5,8 +5,8 @@ import time
 from mindspore import load_checkpoint, load_param_into_net
 from mindspore import context
 
-from data_utils import build_dataset
-from models.aagcn import AAGCN
+from src.data_utils import build_dataset
+from src.aagcn import AAGCN
 from train import parse_args
 import mindspore.ops as ops
 import mindspore
