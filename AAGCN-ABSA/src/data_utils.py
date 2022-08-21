@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import pickle
+from random import shuffle
 import mindspore
 import numpy as np
 import mindspore.dataset.engine as de
@@ -151,15 +152,11 @@ def padding(datas, mode:str ='max', content_length:int=80, grade_size:int = 32, 
     return datas
 
 class ABSADataSet():
-    def __init__(self, dataset_path='', dataset_prefix='', pad_mode='max', 
-        pad_key='', sort=True, embed_dim=300, tokenize=None):
+    def __init__(self, dataset_path='', dataset_prefix='', embed_dim=300, tokenize=None):
         self.dataset_path = dataset_path
-        self.sort = sort
-        self.pad_key = pad_key
         self.embed_dim = embed_dim
         self.dataset_prefix = dataset_prefix
         self.dataset = self._read_data(self.dataset_path, tokenize)
-        self.dataset = padding(self.dataset, mode=pad_mode, pad_key=pad_key)
 
     def _read_data(self, fname, tokenizer):
         with open(fname, 'r', encoding='utf-8', newline='\n', errors='ignore') as f:
@@ -181,15 +178,9 @@ class ABSADataSet():
                 print(text)
             entity_graph = entity_graphs[graph_id]
             attribute_graph = attribute_graphs[graph_id]
-            all_data.append({
-                'text_indices': text_indices,
-                'polarity': polarity,
-                'entity_graph': entity_graph,
-                'attribute_graph': attribute_graph,
-            })
+            all_data.append((text_indices, polarity, entity_graph, attribute_graph, len(text_indices)))
             graph_id += 1
-        if self.sort:
-            all_data.sort(key=lambda x: len(x[self.pad_key]))
+
         return all_data
     
     # 必须实现
@@ -200,74 +191,65 @@ class ABSADataSet():
     def __len__(self):
         return len(self.dataset)
 
-class ABSADataLoader():
-    def __init__(self, dataset='', data_keys=[], batch_size=16, worker_num=1, shuffle=True):
-        device_num = int(os.getenv('RANK_SIZE', 1))
-        rank_id = int(os.getenv('RANK_ID', 0))
-        # 构建采样器，接口详情参考 https://mindspore.cn/docs/zh-CN/r1.7/api_python/dataset/mindspore.dataset.DistributedSampler.html?highlight=distributedsampler
-        distribute_sampler = de.DistributedSampler(
-            num_shards=device_num, # device_num
-            shard_id=rank_id,  # rank_id
-            shuffle=shuffle,
-            num_samples=None
-        )
-        # 构建数据迭代器，接口详情参考 https://mindspore.cn/docs/zh-CN/r1.7/api_python/dataset/mindspore.dataset.GeneratorDataset.html?highlight=generatordataset
-        # 自定义数据集： https://mindspore.cn/tutorials/zh-CN/r1.7/advanced/dataset/custom.html
-        self.dataset = de.GeneratorDataset(
-            dataset,
-            data_keys,
-            sampler=distribute_sampler,
-            num_parallel_workers=worker_num,
-            # python_multiprocessing=(worker_num>1)
-        )
-        self.dataset = self.dataset.batch(
-            batch_size, 
-            drop_remainder=True, 
-            num_parallel_workers=worker_num, 
-            # python_multiprocessing=(worker_num>1)
-        )
+def build_ABSA(dataset='', data_keys=[], batch_size=16, worker_num=1, shuffle=True):
+    dataset = de.GeneratorDataset(
+        dataset,
+        data_keys,
+        shuffle=shuffle,
+        num_parallel_workers=worker_num,
+    )
+    dataset = dataset.bucket_batch_by_length(
+        column_names=['text_indices'], bucket_boundaries=[16, 24, 32],
+        bucket_batch_sizes= [batch_size] * 4, drop_remainder=False
+    )
+    return dataset
 
-def build_dataset(dataset_prefix, knowledge_base, worker_num=1, valset_ratio=0):
+def accumulate(lengths):
+    offsets = [0]
+    for idx, i in enumerate(lengths):
+        offsets.append(i + offsets[idx])
+    return offsets[1:]
+
+def random_split(dataset, lengths):
+    shuffle(dataset)
+    return [dataset[offset - length: offset] for offset, length in zip(accumulate(lengths), lengths)]
+
+def build_dataset(dataset_prefix, knowledge_base, batch_size=16, worker_num=1, valset_ratio=0):
     train_dataset_path = './dataset/{}/{}_train.raw.tokenized'.format(knowledge_base, dataset_prefix)
     test_dataset_path = './dataset/{}/{}_test.raw.tokenized'.format(knowledge_base, dataset_prefix)
     tokenize = get_tokenizer(dataset_prefix, [train_dataset_path, test_dataset_path])
     embedding_matrix = build_embedding_matrix(tokenize.word2idx, 300, dataset_prefix)
-    data_keys = [ 'text_indices', 'polarity', 'entity_graph', 'attribute_graph', 'seq_length' ]
+    data_keys = ['text_indices', 'polarity', 'entity_graph', 'attribute_graph', 'seq_length']
 
     train_dataset = ABSADataSet(
         dataset_path=train_dataset_path,
         dataset_prefix=dataset_prefix,
-        pad_key='text_indices',
-        pad_mode='max',
-        sort=True,
         embed_dim=300,
         tokenize=tokenize
     ).dataset
+
     test_dataset = ABSADataSet(
         dataset_path=test_dataset_path,
         dataset_prefix=dataset_prefix,
-        pad_key='text_indices',
-        pad_mode='max',
-        sort=True,
         embed_dim=300,
         tokenize=tokenize
     ).dataset
 
     if valset_ratio>0:
-        split_index = int(len(train_dataset)*(1-valset_ratio))
-        train_dataset, val_dataset = train_dataset[:split_index], train_dataset[split_index:]
+        valset_len = int(len(train_dataset) * valset_ratio)
+        train_dataset, val_dataset = random_split(train_dataset, (len(train_dataset) - valset_len, valset_len))
     else:
         val_dataset = test_dataset
 
-    train_loader = ABSADataLoader(
+    train_loader = build_ABSA(
         dataset=train_dataset, data_keys=data_keys, 
-        batch_size=16, worker_num=worker_num, shuffle=True).dataset
-    val_loader = ABSADataLoader(
-        dataset=val_dataset, data_keys=data_keys, 
-        batch_size=16, worker_num=worker_num, shuffle=False).dataset
-    test_loader = ABSADataLoader(
+        batch_size=batch_size, worker_num=worker_num, shuffle=False)
+    val_loader = build_ABSA(
+        dataset=val_dataset, data_keys=data_keys,
+        batch_size=batch_size, worker_num=worker_num, shuffle=False)
+    test_loader = build_ABSA(
         dataset=test_dataset, data_keys=data_keys, 
-        batch_size=16, worker_num=worker_num, shuffle=False).dataset
+        batch_size=batch_size, worker_num=worker_num, shuffle=False)
     return train_loader, val_loader, test_loader, embedding_matrix
 
 if __name__=='__main__':

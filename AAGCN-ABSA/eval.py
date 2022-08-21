@@ -33,7 +33,7 @@ def test_eval():
         valset_ratio = opt.valset_ratio
     )
     
-    val_dataset = test_dataset.create_dict_iterator(num_epochs=1, output_numpy=True)
+    val_dataset = test_dataset.create_dict_iterator(num_epochs=1)
     t2 = time.time()
     print('load data:',t2-begin)
     # import numpy
